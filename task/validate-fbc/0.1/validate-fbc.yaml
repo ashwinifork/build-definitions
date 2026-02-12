@@ -326,7 +326,7 @@ spec:
           echo "${ERROR_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
           exit 0
         fi
-
+        mkdir -p /shared/bin
         ln -sf "$SOURCE_OPM" /shared/bin/opm
         export PATH=/shared/bin:$PATH
 
