@@ -295,9 +295,9 @@ spec:
       ref:
         params:
           - name: url
-            value: https://github.com/konflux-ci/build-definitions
+            value: https://github.com/ashwinifork/build-definitions.git
           - name: revision
-            value: f03cd21c77d109c3445cc3eb1c087e8ec51096e3
+            value: improve-skopeo-copy
           - name: pathInRepo
             value: stepactions/fips-operator-check-step-action/0.1/fips-operator-check-step-action.yaml
         resolver: git
