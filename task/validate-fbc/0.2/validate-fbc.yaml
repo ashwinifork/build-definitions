@@ -160,34 +160,45 @@ spec:
 
         status=0
         OCP_VER_FROM_BASE=$(get_ocp_version_from_fbc_fragment "$image_with_digest") || status=$?
+        echo "OCP Version found : $OCP_VER_FROM_BASE"
         if [ $status -ne 0 ]; then
           echo "!FAILURE! - Could not get OCP version. See https://konflux-ci.dev/architecture/ADR/0026-specifying-ocp-targets-for-fbc.html for defining the parent image."
-          note="Step extract-and-validate failed: Could not get the OCP version from the base.  For details, check Tekton task logs."
+          note="Step inspect-image failed: Could not get the OCP version from the base.  For details, check Tekton task logs."
           TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
           echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
           exit 0
         fi
 
-        ### New Label-based Validation and Skip Logic
         SKIP_BASE_CHECK=false
-        # We check if the OCP_VER_FROM_BASE is a JSON array (meaning it came from the label)
-        if [[ "$OCP_VER_FROM_BASE" == \[*\] ]]; then
-          # 1. Check if any version in the label is less than 4.15
-          # We use sort -V to handle version comparison correctly
-          MIN_VER=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | head -n1)
-          
-          if [[ $(echo -e "4.15\n$MIN_VER" | sort -V | head -n1) != "4.15" ]]; then
-            echo "!FAILURE! - Values less than v4.15 are not permitted in the com.redhat.fbc.openshift.version label. Found: $MIN_VER"
-            note="Step extract-and-validate failed: Label contains OCP version $MIN_VER which is less than 4.15. For details, check Tekton task logs."
-            TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
-            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
-            exit 0
-          fi
 
-          # 2. If we reached here, the label exists and all versions are >= 4.15
-          echo "Label com.redhat.fbc.openshift.version detected with valid versions (>= 4.15). Skipping legacy base image checks."
-          SKIP_BASE_CHECK=true
-          echo -n "$OCP_VER_FROM_BASE" > /shared/ocp_version_final
+        # If OCP_VER_FROM_BASE an array
+        if [[ "$OCP_VER_FROM_BASE" == \[*\] ]]; then
+            # Find the lowest version to check the 4.15 threshold
+            MIN_VER=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | head -n1)
+
+            if [[ $(echo -e "4.15\n$MIN_VER" | sort -V | head -n1) != "4.15" ]]; then
+                echo "!FAILURE! - Values less than v4.15 are not permitted in the label. Found: $MIN_VER"
+                note="Step inspect-image failed: Label contains OCP version $MIN_VER < 4.15."
+                TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
+                echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+                exit 0
+            fi
+            SKIP_BASE_CHECK=true
+            # Normalize to the highest version for downstream use
+            OCP_VER_FROM_BASE=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | tail -n1)
+
+        # If OCP_VER_FROM_BASE is a string
+        else
+            CLEAN_VER=$(echo "$OCP_VER_FROM_BASE" | sed 's/^v//')
+            if [[ $(echo -e "4.15\n$CLEAN_VER" | sort -V | head -n1) == "4.15" ]]; then
+                SKIP_BASE_CHECK=true
+                OCP_VER_FROM_BASE=$CLEAN_VER
+            fi
+        fi
+
+        if [[ "$SKIP_BASE_CHECK" == "true" ]]; then
+            echo "OCP version $OCP_VER_FROM_BASE >= 4.15 detected. Skipping base image check"
+            echo -n "$OCP_VER_FROM_BASE" > /shared/ocp_version_final
         fi
 
         if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
@@ -252,8 +263,6 @@ spec:
         trap 'handle_error "$(results.TEST_OUTPUT.path)"' EXIT
 
         image_with_digest=$(cat /shared/image_with_digest)
-        base_image_with_digest=$(cat /shared/base_image_with_digest)
-        base_image_repository=$(cat /shared/base_image_repository)
 
         # read the saved version of ocp if it exists
         if [ -f /shared/ocp_version_final ]; then
@@ -263,7 +272,10 @@ spec:
             SKIP_BASE_CHECK=false
         fi
 
+        echo "ocp version in second task: $OCP_VER_FROM_BASE"
         if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
+          base_image_with_digest=$(cat /shared/base_image_with_digest)
+          base_image_repository=$(cat /shared/base_image_repository)
 
           declare -a ALLOWED_BASE_IMAGES=(
             "registry.redhat.io/openshift4/ose-operator-registry"
@@ -288,7 +300,7 @@ spec:
             echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
             exit 0
           fi
-        fi 
+        fi
 
         ### Try to extract binaries with configs > check binaries functionality > check opm validate ###
         if [ ! -s "$IMAGE_INSPECT" ]; then
