@@ -158,34 +158,69 @@ spec:
         echo "Image ${image_with_digest} raw metadata:"
         jq < "$RAW_IMAGE_INSPECT" # jq for readable formatting
 
-        echo "Getting base image manifest for source image ${image_with_digest}."
-        if ! get_base_image "${image_with_digest}" > /shared/base_image
-        then
-          echo "Unable to find base image for ${image_with_digest}."
-          note="Step inspect-image failed: Cannot find base image. For details, check Tekton task log."
-          TEST_OUTPUT=$(make_result_json -r ERROR -t "$note")
+        status=0
+        OCP_VER_FROM_BASE=$(get_ocp_version_from_fbc_fragment "$image_with_digest") || status=$?
+        if [ $status -ne 0 ]; then
+          echo "!FAILURE! - Could not get OCP version. See https://konflux-ci.dev/architecture/ADR/0026-specifying-ocp-targets-for-fbc.html for defining the parent image."
+          note="Step extract-and-validate failed: Could not get the OCP version from the base.  For details, check Tekton task logs."
+          TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
           echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
           exit 0
         fi
 
-        echo "Detected base image:"
-        cat /shared/base_image
-        echo -e "\nDetected base image repository:"
-        get_image_registry_and_repository "$(cat /shared/base_image)" | tee /shared/base_image_repository
-        echo -e "\nDetected base image:"
-        echo "get_image_registry_repository_digest $(cat /shared/base_image)"
-        get_image_registry_repository_digest "$(cat /shared/base_image)" | tee /shared/base_image_with_digest
-        echo "" # the above has no newline
-        base_image_with_digest=$(cat /shared/base_image_with_digest)
+        ### New Label-based Validation and Skip Logic
+        SKIP_BASE_CHECK=false
+        # We check if the OCP_VER_FROM_BASE is a JSON array (meaning it came from the label)
+        if [[ "$OCP_VER_FROM_BASE" == \[*\] ]]; then
+          # 1. Check if any version in the label is less than 4.15
+          # We use sort -V to handle version comparison correctly
+          MIN_VER=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | head -n1)
+          
+          if [[ $(echo -e "4.15\n$MIN_VER" | sort -V | head -n1) != "4.15" ]]; then
+            echo "!FAILURE! - Values less than v4.15 are not permitted in the com.redhat.fbc.openshift.version label. Found: $MIN_VER"
+            note="Step extract-and-validate failed: Label contains OCP version $MIN_VER which is less than 4.15. For details, check Tekton task logs."
+            TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
+            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+            exit 0
+          fi
 
-        echo "Inspecting base image ${base_image_with_digest}."
-        if ! retry skopeo inspect --retry-times "$skopeo_retries" --no-tags "docker://$base_image_with_digest"  > "$BASE_IMAGE_INSPECT"
-        then
-          echo "Failed to inspect base image ${base_image_with_digest}"
-          note="Step inspect-image failed: Encountered errors while inspecting image. For details, check Tekton task log."
-          TEST_OUTPUT=$(make_result_json -r ERROR -t "$note")
-          echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
-          exit 0
+          # 2. If we reached here, the label exists and all versions are >= 4.15
+          echo "Label com.redhat.fbc.openshift.version detected with valid versions (>= 4.15). Skipping legacy base image checks."
+          SKIP_BASE_CHECK=true
+          echo -n "$OCP_VER_FROM_BASE" > /shared/ocp_version_final
+        fi
+
+        if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
+
+          echo "Getting base image manifest for source image ${image_with_digest}."
+          if ! get_base_image "${image_with_digest}" > /shared/base_image
+          then
+            echo "Unable to find base image for ${image_with_digest}."
+            note="Step inspect-image failed: Cannot find base image. For details, check Tekton task log."
+            TEST_OUTPUT=$(make_result_json -r ERROR -t "$note")
+            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+            exit 0
+          fi
+
+          echo "Detected base image:"
+          cat /shared/base_image
+          echo -e "\nDetected base image repository:"
+          get_image_registry_and_repository "$(cat /shared/base_image)" | tee /shared/base_image_repository
+          echo -e "\nDetected base image:"
+          echo "get_image_registry_repository_digest $(cat /shared/base_image)"
+          get_image_registry_repository_digest "$(cat /shared/base_image)" | tee /shared/base_image_with_digest
+          echo "" # the above has no newline
+          base_image_with_digest=$(cat /shared/base_image_with_digest)
+
+          echo "Inspecting base image ${base_image_with_digest}."
+          if ! retry skopeo inspect --retry-times "$skopeo_retries" --no-tags "docker://$base_image_with_digest"  > "$BASE_IMAGE_INSPECT"
+          then
+            echo "Failed to inspect base image ${base_image_with_digest}"
+            note="Step inspect-image failed: Encountered errors while inspecting image. For details, check Tekton task log."
+            TEST_OUTPUT=$(make_result_json -r ERROR -t "$note")
+            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+            exit 0
+          fi
         fi
     - name: extract-and-validate
       image: quay.io/konflux-ci/konflux-test:v1.4.44@sha256:00d5ba3ac4fadb315da2199e931c1167f2b45884d2990de39104dfa9b78117d4
@@ -220,39 +255,40 @@ spec:
         base_image_with_digest=$(cat /shared/base_image_with_digest)
         base_image_repository=$(cat /shared/base_image_repository)
 
-        declare -a ALLOWED_BASE_IMAGES=(
-          "registry.redhat.io/openshift4/ose-operator-registry"
-          "registry.redhat.io/openshift4/ose-operator-registry-rhel9"
-          "brew.registry.redhat.io/rh-osbs/openshift-ose-operator-registry-rhel9"
-        )
+        # read the saved version of ocp if it exists
+        if [ -f /shared/ocp_version_final ]; then
+            OCP_VER_FROM_BASE=$(cat /shared/ocp_version_final)
+            SKIP_BASE_CHECK=true
+        else
+            SKIP_BASE_CHECK=false
+        fi
 
-        ### FBC base image check
-        allowed=false
-        for value in "${ALLOWED_BASE_IMAGES[@]}"
-        do
-          if [[ "${base_image_repository}" == "${value}" ]]; then
-            allowed=true
-            break
+        if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
+
+          declare -a ALLOWED_BASE_IMAGES=(
+            "registry.redhat.io/openshift4/ose-operator-registry"
+            "registry.redhat.io/openshift4/ose-operator-registry-rhel9"
+            "brew.registry.redhat.io/rh-osbs/openshift-ose-operator-registry-rhel9"
+          )
+
+          ### FBC base image check
+          allowed=false
+          for value in "${ALLOWED_BASE_IMAGES[@]}"
+          do
+            if [[ "${base_image_repository}" == "${value}" ]]; then
+              allowed=true
+              break
+            fi
+          done
+
+          if [[ "${allowed}" == false ]]; then
+            echo "Base image ${base_image_with_digest} is not allowed for the file based catalog image. Allowed images: " "${ALLOWED_BASE_IMAGES[@]}"
+            note="Step extract-and-validate failed: Base image ${base_image_with_digest} is not allowed for the file based catalog image. For details, check Tekton task logs."
+            TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
+            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+            exit 0
           fi
-        done
-
-        if [[ "${allowed}" == false ]]; then
-          echo "Base image ${base_image_with_digest} is not allowed for the file based catalog image. Allowed images: " "${ALLOWED_BASE_IMAGES[@]}"
-          note="Step extract-and-validate failed: Base image ${base_image_with_digest} is not allowed for the file based catalog image. For details, check Tekton task logs."
-          TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
-          echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
-          exit 0
-        fi
-
-        status=0
-        OCP_VER_FROM_BASE=$(get_ocp_version_from_fbc_fragment "$image_with_digest") || status=$?
-        if [ $status -ne 0 ]; then
-          echo "!FAILURE! - Could not get OCP version. See https://konflux-ci.dev/architecture/ADR/0026-specifying-ocp-targets-for-fbc.html for defining the parent image."
-          note="Step extract-and-validate failed: Could not get the OCP version from the base.  For details, check Tekton task logs."
-          TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
-          echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
-          exit 0
-        fi
+        fi 
 
         ### Try to extract binaries with configs > check binaries functionality > check opm validate ###
         if [ ! -s "$IMAGE_INSPECT" ]; then
@@ -296,16 +332,6 @@ spec:
           TEST_OUTPUT="$(make_result_json -r ERROR)"
           echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
           popd
-          exit 0
-        fi
-
-        EXTRACT_DIR="/extracted_base_img"
-        mkdir "${EXTRACT_DIR}"
-        if ! retry oc image extract "${base_image_with_digest}" --path /:"${EXTRACT_DIR}"; then
-          echo "Unable to extract opm binary"
-          note="Step extract-and-validate failed: Failed to extract base image with oc extract command, so it cannot validate extracted binaries.  For details, check Tekton task log."
-          ERROR_OUTPUT=$(make_result_json -r ERROR -t "$note")
-          echo "${ERROR_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
           exit 0
         fi
 
