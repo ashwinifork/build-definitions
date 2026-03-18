@@ -5,7 +5,7 @@ apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   labels:
-    app.kubernetes.io/version: "0.1"
+    app.kubernetes.io/version: "0.2"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: "konflux"
@@ -145,7 +145,7 @@ spec:
         echo "Image ${image_with_digest} metadata:"
         cat "$IMAGE_INSPECT"
 
-        echo "Inspecting manifest for source image ${image_with_digest}."
+        echo "Inspecting raw manifest for source image ${image_with_digest}."
         if ! retry skopeo inspect --retry-times "$skopeo_retries" --no-tags --raw docker://"${image_with_digest}" > "$RAW_IMAGE_INSPECT"
         then
           echo "Failed to get raw metadata of image ${image_with_digest}"
@@ -159,8 +159,9 @@ spec:
         jq < "$RAW_IMAGE_INSPECT" # jq for readable formatting
 
         status=0
-        OCP_VER_FROM_BASE=$(get_ocp_version_from_fbc_fragment "$image_with_digest") || status=$?
-        echo "OCP Version found : $OCP_VER_FROM_BASE"
+        OCP_VERSION=$(get_ocp_version_from_fbc_fragment "$image_with_digest") || status=$?
+        OCP_VERSION='["v4.17", "v4.18", "v4.22"]'
+        echo "OCP Version found : $OCP_VERSION"
         if [ $status -ne 0 ]; then
           echo "!FAILURE! - Could not get OCP version. See https://konflux-ci.dev/architecture/ADR/0026-specifying-ocp-targets-for-fbc.html for defining the parent image."
           note="Step inspect-image failed: Could not get the OCP version from the base.  For details, check Tekton task logs."
@@ -169,36 +170,42 @@ spec:
           exit 0
         fi
 
-        # Declare SKIP_BASE_CHECK to skip the base image check for ocp versions >= v4.15
-        SKIP_BASE_CHECK=false
+        # SKIP_BASE_IMAGE_CHECK is a flag to decide if base image check should be skipped.
+        # It will be skipped when the return value of  get_ocp_version_from_fbc_fragment will be a list
+        # extracted from the  com.redhat.fbc.openshift.version indicating a binaryless FBC image.
+        # Binaryless FBCs are only allowed for OCP versions >=v4.15
+        SKIP_BASE_IMAGE_CHECK=false
+        OCP_VERSION_FROM_LABEL=""
+        OCP_VERSIONS_FROM_BASE=""
 
-        OCP_VER_FROM_BASE='["v4.15", "v4.16", "v4.17", "v4.18", "v4.22"]'          
-        # If label 'com.redhat.fbc.openshift.version'  is an array
-        if [[ "$OCP_VER_FROM_BASE" == \[*\] ]]; then
-            # Find the lowest version to check the 4.15 threshold
-            MIN_VER=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | head -n1)
+        if [[ "$OCP_VERSION" == \[*\] ]]; then
+            # Find the lowest version to check if the array have any version < v4.15
+            CLEANED_LIST=$(echo "$OCP_VERSION" | jq -r '.[]' | sed 's/^v//' | sort -V)
+            MIN_VER=$(echo "$CLEANED_LIST" | head -n1)
 
             if [[ $(echo -e "4.15\n$MIN_VER" | sort -V | head -n1) != "4.15" ]]; then
-                echo "!ERROR! - Values less than v4.15 are not permitted in the label. Found: $MIN_VER"
-                note="Step inspect-image failed: Label contains OCP version $MIN_VER < 4.15."
+                echo "!ERROR! - Version less than v4.15 are not permitted in the label 'com.redhat.fbc.openshift.version'. Found: $MIN_VER"
+                note="Step inspect-image failed: 'com.redhat.fbc.openshift.version' Label contains OCP version $MIN_VER < 4.15."
                 TEST_OUTPUT=$(make_result_json -r ERROR -f 1 -t "$note")
                 echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
                 exit 0
+            else
+                echo "All OCP versions in label 'com.redhat.fbc.openshift.version' -> $(echo "$CLEANED_LIST" | tr '\n' ' ') are  >= 4.15 . Will skip base image check"
             fi
-            SKIP_BASE_CHECK=true
-            # Normalize to the highest version for downstream use
-            #ALLOWED_OCP_VERSION=OCP_VER_FROM_BASE
-            VERSIONS=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//')
-            OCP_VER_FROM_BASE=$(echo "$OCP_VER_FROM_BASE" | jq -r '.[]' | sed 's/^v//' | sort -V | tail -n1)
+
+            SKIP_BASE_IMAGE_CHECK=true
+            OCP_VERSION_FROM_LABEL=$(echo "$CLEANED_LIST" | xargs)
+            echo -n "$OCP_VERSION_FROM_LABEL" > /shared/ocp_versions_from_label
+
+        else
+            CLEAN_VER="${OCP_VERSION#v}"
+
+            SKIP_BASE_IMAGE_CHECK=false
+            OCP_VERSIONS_FROM_BASE="$CLEAN_VER"
+            echo -n "$OCP_VERSIONS_FROM_BASE" > /shared/ocp_versions_from_base
         fi
 
-        if [[ "$SKIP_BASE_CHECK" == "true" ]]; then
-            echo "OCP version $OCP_VER_FROM_BASE >= 4.15 detected. Skipping base image check"
-            echo -n "$OCP_VER_FROM_BASE" > /shared/ocp_versions_from_label
-            echo -n "$VERSIONS" > /shared/ocp_versions
-        fi
-
-        if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
+        if [[ "${SKIP_BASE_IMAGE_CHECK}" == "false" ]]; then
 
           echo "Getting base image manifest for source image ${image_with_digest}."
           if ! get_base_image "${image_with_digest}" > /shared/base_image
@@ -262,16 +269,20 @@ spec:
         image_with_digest=$(cat /shared/image_with_digest)
 
         # read the saved version of ocp if it exists
+        OCP_VERSIONS=""
         if [ -f /shared/ocp_versions_from_label ]; then
-            OCP_VER_FROM_BASE=$(cat /shared/ocp_versions_from_label)
-            OCP_VERSIONS=$(cat /shared/ocp_versions)
-            SKIP_BASE_CHECK=true
+            # OCP version label exists (skip base check)
+            OCP_VERSIONS=$(cat /shared/ocp_versions_from_label)
+            echo "OCP version from label: $OCP_VERSIONS"
+            SKIP_BASE_IMAGE_CHECK=true
         else
-            SKIP_BASE_CHECK=false
+            # Label doesn't exist, so base file must exist
+            OCP_VERSIONS=$(cat /shared/ocp_versions_from_base)
+            echo "OCP version from base: $OCP_VERSIONS"
+            SKIP_BASE_IMAGE_CHECK=false
         fi
 
-        echo "ocp version in second task: $OCP_VER_FROM_BASE"
-        if [[ "${SKIP_BASE_CHECK}" == "false" ]]; then
+        if [[ "${SKIP_BASE_IMAGE_CHECK}" == "false" ]]; then
           base_image_with_digest=$(cat /shared/base_image_with_digest)
           base_image_repository=$(cat /shared/base_image_repository)
 
@@ -356,19 +367,20 @@ spec:
             echo "!ERROR! - Required binary /usr/bin/$OPM_BIN not found."
             echo "Available opm binaries in /usr/bin:"
             ls -l /usr/bin/opm*
-            
+
             note="Step extract-and-validate failed: Required OPM binary ($OPM_BIN) was not found. Check task logs for available versions."
             ERROR_OUTPUT=$(make_result_json -r ERROR -t "$note")
             echo "${ERROR_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
             exit 0
           fi
         done
-        
-        HIGHEST_OPM=$(echo "$UNIQUE_OPM_VERSIONS" | tail -n1)
-        echo "Default opm version set to: $HIGHEST_OPM"
+
+        # Set highest OPM versoin as default to verify if FBC can de rendered successfully
+        HIGHEST_OPM_VERSION=$(echo "$UNIQUE_OPM_VERSIONS" | tail -n1)
+        echo "Default opm version set to: $HIGHEST_OPM_VERSION"
 
         mkdir -p /shared/bin
-        ln -sf "/usr/bin/$HIGHEST_OPM" /shared/bin/opm
+        ln -sf "/usr/bin/$HIGHEST_OPM_VERSION" /shared/bin/opm
         export PATH=/shared/bin:$PATH
 
         # We have 10 total checks
@@ -429,14 +441,20 @@ spec:
           fi
         fi
 
+        opm_validation_failed=false
+
         for OPM_BIN_NAME in $UNIQUE_OPM_VERSIONS; do
           echo "Validating with $OPM_BIN_NAME"
-          if ! "$SOURCE_OPM" validate ."${conffolder}"; then
+          if ! "$OPM_BIN_NAME" validate ."${conffolder}"; then
             echo "!FAILURE! - opm validate check failed using version $OPM_BIN_NAME."
-            failure_num=$((failure_num + 1))
-            TESTPASSED=false
+            opm_validation_failed=true
           fi
         done
+
+        if [ "$opm_validation_failed" = true ]; then
+          TESTPASSED=false
+          failure_num=$((failure_num + 1))
+        fi
 
         echo "Rendering catalog fragment."
         OPM_RENDERED_CATALOG=/shared/catalog.json
@@ -453,12 +471,31 @@ spec:
           TESTPASSED=false
         fi
 
-        # examines the base image tag to derive the target OCP version
+        # Identify the first and last ocp versions
+        MIN_VER=$(echo "$OCP_VERSIONS" | awk '{print $1}')
+        MAX_VER=$(echo "$OCP_VERSIONS" | awk '{print $NF}')
+
+        # Exit if ocp versions here contains both something < v4.17  and >= v4.17
+        if [[ $(echo -e "4.17\n$MIN_VER" | sort -V | head -n1) != "4.17" ]] && \
+           [[ $(echo -e "4.17\n$MAX_VER" | sort -V | head -n1) == "4.17" ]]; then
+            echo "Mixed range detected ($MIN_VER to $MAX_VER)."
+            echo "Failed to inspect base image ${image_with_digest}"
+            note="Step extract-and-validate failed: Encountered errors while inspecting image. For details, check Tekton task log."
+            TEST_OUTPUT=$(make_result_json -r ERROR -t "$note")
+            echo "${TEST_OUTPUT}" | tee "$(results.TEST_OUTPUT.path)"
+            exit 0
+
+        # Entire range is either <v4.17 or >= v4.17
+        else
+            echo "Consistent range detected. Validating against MAX version ($MAX_VER) only."
+        fi
+
+        # examines the highest target OCP version to derive the target OCP version
         # assumes this is in the form
         # image-path:[v]major-digits.minor-digits[@sha...]
         # extracts major digits and filters out any leading alphabetic characters, for e.g. 'v4' --> '4'
-        OCP_VER_MAJOR=$(echo "${OCP_VER_FROM_BASE}" | cut -d '.' -f 1 | sed "s/^[a-zA-Z]*//")
-        OCP_VER_MINOR=$(echo "${OCP_VER_FROM_BASE}" | cut -d '.' -f 2)
+        OCP_VER_MAJOR=$(echo "${MAX_VER}" | cut -d '.' -f 1 | sed "s/^[a-zA-Z]*//")
+        OCP_VER_MINOR=$(echo "${MAX_VER}" | cut -d '.' -f 2)
 
         RUN_OCP_VERSION_VALIDATION="false"
         digits_regex='^[0-9]*$'
@@ -467,14 +504,14 @@ spec:
         fi
 
         if [ "${RUN_OCP_VERSION_VALIDATION}" == "false" ] ; then
-          echo "!WARNING! - unable to assess bundle metadata alignment with OCP version because we cannot parse OCP version from the base image ${OCP_VER_FROM_BASE}"
+          echo "!WARNING! - unable to assess bundle metadata alignment with OCP version because we cannot parse OCP version ${MAX_VER}"
         else
           OCP_BUNDLE_METADATA_THRESHOLD_MAJOR=4
           OCP_BUNDLE_METADATA_THRESHOLD_MINOR=17
           OCP_BUNDLE_METADATA_FORMAT="olm.bundle.object"
 
           if [[ "${OCP_VER_MAJOR}" -ge "${OCP_BUNDLE_METADATA_THRESHOLD_MAJOR}" ]] && [[ "${OCP_VER_MINOR}" -ge "${OCP_BUNDLE_METADATA_THRESHOLD_MINOR}" ]]; then
-             OCP_BUNDLE_METADATA_FORMAT="olm.csv.metadata"
+            OCP_BUNDLE_METADATA_FORMAT="olm.csv.metadata"
           fi
 
           # enforce the presence of either olm.csv.metadata or olm.bundle.object based on OCP version
