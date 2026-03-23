@@ -1,11 +1,9 @@
 # validate-fbc task
 
 ## Checks
-### Valid base image
+### (If OCP version is <4.15) Valid base image
 To validate the image in build pipeline, Skopeo is used to extract
-information from the image itself and then contents are checked using the OpenShift Operator Framework.  The binary
-used to run the validation is extracted from the base image for the component being tested.  Because of this, the
-base image must come from a trusted source.  Trusted sources are declared in `ALLOWED_BASE_IMAGES` in fbc-validation.yaml.
+information from the image itself and then contents are checked using the OpenShift Operator Framework. The konflux-test image provides opm binary to execute the validation. 
 
 ### Valid FBC schema
 To validate the schema format of the FBC fragment, the test

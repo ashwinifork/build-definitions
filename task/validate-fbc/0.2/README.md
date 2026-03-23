@@ -1,6 +1,8 @@
 # validate-fbc task
 
-Ensures file-based catalog (FBC) components are uniquely linted for proper construction as part of build pipeline. The manifest data of container images is checked using OpenShift Operator Framework's opm CLI tool. The opm binary is extracted from the container's base image, which must come from a trusted source.
+Ensures file-based catalog (FBC) components are uniquely linted for proper construction as part of build pipeline. The manifest data of container images is checked using OpenShift Operator Framework's opm CLI tool. The target OCP version is determined by reading the com.redhat.fbc.openshift.version label, or by falling back to the base image tag if the label is missing. If the identified OCP version is 4.15 or higher, the strict base image check is bypassed.
+
+The  `opm` binary executes directly from the `konflux-test` image, removing the dependency on extracting it from the `operator-registry` base image of the FBC fragment. 
 
 ## Parameters
 |name|description|default value|required|
