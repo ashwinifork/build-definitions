@@ -180,6 +180,8 @@ spec:
             echo "No unreleased bundles found. Skipping check."
             exit 0
           fi
+          
+          extract_start=$(date +%s.%N)
 
           for bundle in ${unreleased_bundles}; do
             echo "Processing bundle image : ${bundle}"
@@ -241,6 +243,7 @@ spec:
             fi
 
             manifest_related_images=$(extract_related_images_from_bundle "$bundle")
+
             if [ -n "$manifest_related_images" ]; then
               for img in $manifest_related_images; do
                 if [ -z "${seen_related_images["$img"]:-}" ]; then
@@ -250,9 +253,12 @@ spec:
               done
             fi
             echo "Current unique images list is ${unique_related_images[*]}"
-
           done
         done < <(echo "$image_manifests" | jq -r 'to_entries[] | "\(.key) \(.value)"')
+
+        extract_end=$(date +%s.%N)
+        extract_duration=$(awk "BEGIN {print $extract_end - $extract_start}")
+        echo "TIME TAKEN - Extract related images from bundle: ${extract_duration} seconds"
 
         if [ ${#unique_related_images[@]} -gt 0 ]; then
           echo "Unique related images: ${unique_related_images[*]}"
