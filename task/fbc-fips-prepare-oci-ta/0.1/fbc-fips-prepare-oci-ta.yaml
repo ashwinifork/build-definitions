@@ -104,14 +104,18 @@ spec:
 
         echo "Getting Target ocp version for the FBC fragment"
         image_manifest_sha=$(echo "${image_manifests}" | jq -r 'to_entries[0].value')
-        target_ocp_version=$(get_ocp_version_from_fbc_fragment "$image_without_tag@$image_manifest_sha")
-        echo "${target_ocp_version#v}" >"/tekton/home/target_ocp_version.txt"
-        echo "Target OCP version: ${target_ocp_version}"
 
-        target_index_url=$(get_target_fbc_catalog_image -i "${image_and_digest}")
-        echo "Target index: ${target_index_url}"
+        raw_target_ocp_version=$(get_ocp_version_from_fbc_fragment "$image_without_tag@$image_manifest_sha")
 
-        target_index_repo_reg=$(get_image_registry_and_repository "${target_index_url}")
+        if jq -e 'type == "array"' >/dev/null 2>&1 <<< "$raw_target_ocp_version"; then
+          target_ocp_versions=$(echo "$raw_target_ocp_version" | jq -r '.[]' | sort -V)
+        else
+            target_ocp_versions="$raw_target_ocp_version"
+        fi
+
+
+        echo "${target_ocp_versions#v}" >"/tekton/home/target_ocp_versions.txt"
+        echo "Target OCP versions: ${target_ocp_versions}"
 
         # Get package names from fragment
         echo "Rendering FBC fragment: ${image_and_digest}"
@@ -131,137 +135,148 @@ spec:
           echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
           exit 0
         fi
+
         echo "Packages in FBC fragment: ${fragment_pkg_names}"
-
-        # Get package names from target index
-        echo "Rendering target index: ${target_index_url}"
-        rendered_target_index_file=$(render_opm -t "${target_index_url}" --file)
-        if [[ ! -f "${rendered_target_index_file}" ]]; then
-          note="Task fbc-fips-check-oci-ta failed: Unable to render the fragment target index image: ${IMAGE_URL}"
-          echo "${note}"
-          TEST_OUTPUT=$(make_result_json -r ERROR -t "${note}")
-          echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
-          exit 0
-        fi
-
-        if ! ti_pkg_names=$(extract_unique_package_names_from_catalog "${rendered_target_index_file}" --file); then
-          note="Task fbc-fips-check-oci-ta failed: Could not get package names from the target index."
-          echo "${note}"
-          TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
-          echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
-          exit 0
-        fi
-
-        declare -i unreleased_pkg_count=0
-        for pkg in ${fragment_pkg_names}; do
-          if ! echo "${ti_pkg_names}" | grep -Fwq "${pkg}"; then
-            unreleased_pkg_count+=1
-            echo "${pkg} was not found in target index."
-          fi
-        done
-
-        # If package names not in the target index use the previous version
-        if [[ "${unreleased_pkg_count}" -gt 0 ]]; then
-          echo "One or more packages in the FBC fragment were not found in the target index."
-
-          # Derive previous minor version from target_ocp_version
-          major_ocp_version=$(echo "${target_ocp_version#v}" | awk -F'.' '{print $1}')
-          minor_ocp_version=$(echo "${target_ocp_version#v}" | awk -F'.' '{print $2}')
-          prev_minor_version=$(("${minor_ocp_version}" - 1))
-          prev_ocp_version="v${major_ocp_version}.${prev_minor_version}"
-          echo "Using the previous catalog OCP version to check for unreleased bundles: ${prev_ocp_version}"
-          target_index_url="${target_index_repo_reg}:${prev_ocp_version}"
-        fi
-
         declare -A seen_related_images
-        while read -r _ arch_sha; do
-          digests_processed+=("\"$arch_sha\"")
 
-          if ! unreleased_bundles=$(get_unreleased_bundle -i "$image_without_tag@$arch_sha" -b "$target_index_url"); then
-            note="Task fbc-fips-check-oci-ta failed: Could not get unreleased bundle images from the fragment. Make sure you have ImagePullCredentials for registry.redhat.io"
+        DEFAULT_INDEX_IMAGE="registry.redhat.io/redhat/redhat-operator-index"
+        INDEX_IMAGE=$(parse_image_url "$DEFAULT_INDEX_IMAGE" | jq -jr '.registry_repository')
+
+        for target_ocp_version in $target_ocp_versions; do
+
+          # Get package names from target index
+          target_index_url="$INDEX_IMAGE:$target_ocp_version"
+          echo "Target index: ${target_index_url}"
+          target_index_repo_reg=$(get_image_registry_and_repository "${target_index_url}")
+
+          echo "Rendering target index: ${target_index_url}"
+          rendered_target_index_file=$(render_opm -t "${target_index_url}" --file)
+          if [[ ! -f "${rendered_target_index_file}" ]]; then
+            note="Task fbc-fips-check-oci-ta failed: Unable to render the fragment target index image: ${IMAGE_URL}"
+            echo "${note}"
+            TEST_OUTPUT=$(make_result_json -r ERROR -t "${note}")
+            echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
+            exit 0
+          fi
+
+          if ! ti_pkg_names=$(extract_unique_package_names_from_catalog "${rendered_target_index_file}" --file); then
+            note="Task fbc-fips-check-oci-ta failed: Could not get package names from the target index."
             echo "${note}"
             TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
             echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
             exit 0
           fi
 
-          if [ -z "${unreleased_bundles}" ]; then
-            echo "No unreleased bundles found. Skipping check."
-            exit 0
+          declare -i unreleased_pkg_count=0
+          for pkg in ${fragment_pkg_names}; do
+            if ! echo "${ti_pkg_names}" | grep -Fwq "${pkg}"; then
+              unreleased_pkg_count+=1
+              echo "${pkg} was not found in target index."
+            fi
+          done
+
+          # If package names not in the target index use the previous version
+          if [[ "${unreleased_pkg_count}" -gt 0 ]]; then
+            echo "One or more packages in the FBC fragment were not found in the target index."
+
+            # Derive previous minor version from target_ocp_version
+            major_ocp_version=$(echo "${target_ocp_version#v}" | awk -F'.' '{print $1}')
+            minor_ocp_version=$(echo "${target_ocp_version#v}" | awk -F'.' '{print $2}')
+            prev_minor_version=$(("${minor_ocp_version}" - 1))
+            prev_ocp_version="v${major_ocp_version}.${prev_minor_version}"
+            echo "Using the previous catalog OCP version to check for unreleased bundles: ${prev_ocp_version}"
+            target_index_url="${target_index_repo_reg}:${prev_ocp_version}"
           fi
 
-          for bundle in ${unreleased_bundles}; do
-            echo "Processing bundle image : ${bundle}"
+          while read -r _ arch_sha; do
+            digests_processed+=("\"$arch_sha\"")
 
-            image_accessible=0
-            if ! bundle_out=$(opm render "$bundle"); then
-              echo "Could not inspect original pullspec $bundle. Checking if there's a mirror present"
-              if [ -n "${image_mirror_map}" ]; then
-                reg_and_repo=$(get_image_registry_and_repository "${bundle}")
-                mapfile -t mirrors < <(get_image_mirror_list "${reg_and_repo}" "${image_mirror_map}")
-                if [[ -z "${mirrors[0]}" ]]; then
-                  echo "No mirrors found in image mirror map for ${reg_and_repo}"
-                else
-                  echo "Mirrors for $reg_and_repo are:"
-                  printf "%s\n" "${mirrors[@]}"
-
-                  for mirror in "${mirrors[@]}"; do
-                    echo "Attempting to use mirror ${mirror}"
-                    replaced_image=$(replace_image_pullspec "$bundle" "$mirror")
-                    if ! bundle_out=$(opm render "$replaced_image"); then
-                      echo "Mirror $mirror is inaccessible."
-                      continue
-                    fi
-                    image_accessible=1
-                    echo "Replacing $bundle with $replaced_image"
-                    bundle="$replaced_image"
-                    break
-                  done
-                fi
-              fi
-            else
-              image_accessible=1
-              echo "Successfully inspected $bundle. Mirror not required."
-            fi
-
-            # Run the FIPS check only if the bundle is part of the Openshift Subscription or has the fips label set
-            if [[ $image_accessible -eq 0 ]]; then
-              note="Task fbc-fips-check-oci-ta failed: Could not render unreleased bundle image: ${bundle}. Make sure the image is accessible or a mirror is provided for the same in images-mirror-set.yaml"
+            if ! unreleased_bundles=$(get_unreleased_bundle -i "$image_without_tag@$arch_sha" -b "$target_index_url"); then
+              note="Task fbc-fips-check-oci-ta failed: Could not get unreleased bundle images from the fragment. Make sure you have ImagePullCredentials for registry.redhat.io"
               echo "${note}"
               TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
               echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
               exit 0
             fi
-            subscription_label=$(echo "${bundle_out}" | jq -r '.properties[] | select((.value | type == "object") and (.value.annotations["operators.openshift.io/valid-subscription"] != null)) | (.value.annotations["operators.openshift.io/valid-subscription"] | fromjson)[]')
 
-            fips_annotation=$(echo "${bundle_out}" | jq -r '.properties[] | select((.value | type == "object") and (.value.annotations["features.operators.openshift.io/fips-compliant"]? == "true")) | .value.annotations["features.operators.openshift.io/fips-compliant"]')
-
-            if ! echo "${subscription_label}" | grep -e "OpenShift Kubernetes Engine" -e "OpenShift Container Platform" -e "OpenShift Platform Plus"; then
-              echo "OpenShift Kubernetes Engine, OpenShift Platform Plus or OpenShift Container Platform are not present in operators.openshift.io/valid-subscription."
-              echo "Subscription labels are : $subscription_label"
-              if [ -z "${fips_annotation}" ] || [ "${fips_annotation}" != "true" ]; then
-                echo "The annotation features.operators.openshift.io/fips-compliant is also not set to true. Skipping the FIPS static check for ${bundle}"
-                continue
-              else
-                echo "The annotation features.operators.openshift.io/fips-compliant is set to true. Running the FIPS static check..."
-              fi
-            else
-              echo "OpenShift Kubernetes Engine, OpenShift Platform Plus or OpenShift Container Platform are present in operators.openshift.io/valid-subscription. Running the FIPS static check..."
+            if [ -z "${unreleased_bundles}" ]; then
+              echo "No unreleased bundles found. Skipping check."
+              exit 0
             fi
 
-            manifest_related_images=$(extract_related_images_from_bundle "$bundle")
-            if [ -n "$manifest_related_images" ]; then
-              for img in $manifest_related_images; do
-                if [ -z "${seen_related_images["$img"]:-}" ]; then
-                  unique_related_images+=("$img")
-                  seen_related_images["$img"]=1
+            for bundle in ${unreleased_bundles}; do
+              echo "Processing bundle image : ${bundle}"
+
+              image_accessible=0
+              if ! bundle_out=$(opm render "$bundle"); then
+                echo "Could not inspect original pullspec $bundle. Checking if there's a mirror present"
+                if [ -n "${image_mirror_map}" ]; then
+                  reg_and_repo=$(get_image_registry_and_repository "${bundle}")
+                  mapfile -t mirrors < <(get_image_mirror_list "${reg_and_repo}" "${image_mirror_map}")
+                  if [[ -z "${mirrors[0]}" ]]; then
+                    echo "No mirrors found in image mirror map for ${reg_and_repo}"
+                  else
+                    echo "Mirrors for $reg_and_repo are:"
+                    printf "%s\n" "${mirrors[@]}"
+
+                    for mirror in "${mirrors[@]}"; do
+                      echo "Attempting to use mirror ${mirror}"
+                      replaced_image=$(replace_image_pullspec "$bundle" "$mirror")
+                      if ! bundle_out=$(opm render "$replaced_image"); then
+                        echo "Mirror $mirror is inaccessible."
+                        continue
+                      fi
+                      image_accessible=1
+                      echo "Replacing $bundle with $replaced_image"
+                      bundle="$replaced_image"
+                      break
+                    done
+                  fi
                 fi
-              done
-            fi
-            echo "Current unique images list is ${unique_related_images[*]}"
+              else
+                image_accessible=1
+                echo "Successfully inspected $bundle. Mirror not required."
+              fi
 
-          done
-        done < <(echo "$image_manifests" | jq -r 'to_entries[] | "\(.key) \(.value)"')
+              # Run the FIPS check only if the bundle is part of the Openshift Subscription or has the fips label set
+              if [[ $image_accessible -eq 0 ]]; then
+                note="Task fbc-fips-check-oci-ta failed: Could not render unreleased bundle image: ${bundle}. Make sure the image is accessible or a mirror is provided for the same in images-mirror-set.yaml"
+                echo "${note}"
+                TEST_OUTPUT=$(make_result_json -r FAILURE -f 1 -t "$note")
+                echo "${TEST_OUTPUT}" > /tekton/home/test_output.txt
+                exit 0
+              fi
+              subscription_label=$(echo "${bundle_out}" | jq -r '.properties[] | select((.value | type == "object") and (.value.annotations["operators.openshift.io/valid-subscription"] != null)) | (.value.annotations["operators.openshift.io/valid-subscription"] | fromjson)[]')
+
+              fips_annotation=$(echo "${bundle_out}" | jq -r '.properties[] | select((.value | type == "object") and (.value.annotations["features.operators.openshift.io/fips-compliant"]? == "true")) | .value.annotations["features.operators.openshift.io/fips-compliant"]')
+
+              if ! echo "${subscription_label}" | grep -e "OpenShift Kubernetes Engine" -e "OpenShift Container Platform" -e "OpenShift Platform Plus"; then
+                echo "OpenShift Kubernetes Engine, OpenShift Platform Plus or OpenShift Container Platform are not present in operators.openshift.io/valid-subscription."
+                echo "Subscription labels are : $subscription_label"
+                if [ -z "${fips_annotation}" ] || [ "${fips_annotation}" != "true" ]; then
+                  echo "The annotation features.operators.openshift.io/fips-compliant is also not set to true. Skipping the FIPS static check for ${bundle}"
+                  continue
+                else
+                  echo "The annotation features.operators.openshift.io/fips-compliant is set to true. Running the FIPS static check..."
+                fi
+              else
+                echo "OpenShift Kubernetes Engine, OpenShift Platform Plus or OpenShift Container Platform are present in operators.openshift.io/valid-subscription. Running the FIPS static check..."
+              fi
+
+              manifest_related_images=$(extract_related_images_from_bundle "$bundle")
+              if [ -n "$manifest_related_images" ]; then
+                for img in $manifest_related_images; do
+                  if [ -z "${seen_related_images["$img"]:-}" ]; then
+                    unique_related_images+=("$img")
+                    seen_related_images["$img"]=1
+                  fi
+                done
+              fi
+              echo "Current unique images list is ${unique_related_images[*]}"
+
+            done
+          done < <(echo "$image_manifests" | jq -r 'to_entries[] | "\(.key) \(.value)"')
+        done
 
         if [ ${#unique_related_images[@]} -gt 0 ]; then
           echo "Unique related images: ${unique_related_images[*]}"
